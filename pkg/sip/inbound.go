@@ -21,6 +21,7 @@ import (
 	"math"
 	"net/netip"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +54,10 @@ const (
 	// audioBridgeMaxDelay delays sending audio for certain time, unless RTP packet is received.
 	// This is done because of audio cutoff at the beginning of calls observed in the wild.
 	audioBridgeMaxDelay = 1 * time.Second
+	// Header to allow setting custom options, values formatted as "option1,option2,option3"
+	roundedOptionsHeader = "x-rounded-options"
+	// If set, no ringing (180) will be sent when receiving an inbound invite.
+	roundedOptionsNoRinging = "no-ringing"
 )
 
 func (s *Server) getInvite(from string) *inProgressInvite {
@@ -393,7 +398,16 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 	defer c.mon.CallEnd()
 	defer c.close(true, callDropped, "other")
 
-	c.cc.StartRinging()
+	roundedOpts := ""
+	if h := req.GetHeader(roundedOptionsHeader); h != nil {
+		roundedOpts = strings.ToLower(h.Value())
+		c.log.Debugw("Rounded options found", "x-rounded-options", roundedOpts)
+	}
+
+	if roundedOpts == "" || !strings.Contains(roundedOpts, roundedOptionsNoRinging) {
+		c.cc.StartRinging()
+	}
+
 	// Send initial request. In the best case scenario, we will immediately get a room name to join.
 	// Otherwise, we could even learn that this number is not allowed and reject the call, or ask for pin if required.
 	disp := c.s.handler.DispatchCall(ctx, &CallInfo{
