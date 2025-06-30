@@ -57,6 +57,7 @@ func expectNoResponse(t *testing.T, tx sip.ClientTransaction) {
 type TestHandler struct {
 	GetAuthCredentialsFunc func(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error)
 	DispatchCallFunc       func(ctx context.Context, info *CallInfo) CallDispatch
+	OnSessionEndFunc       func(ctx context.Context, callIdentifier *CallIdentifier, callInfo *livekit.SIPCallInfo, reason string)
 }
 
 func (h TestHandler) GetAuthCredentials(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error) {
@@ -78,6 +79,12 @@ func (h TestHandler) RegisterTransferSIPParticipantTopic(sipCallId string) error
 
 func (h TestHandler) DeregisterTransferSIPParticipantTopic(sipCallId string) {
 	// no-op
+}
+
+func (h TestHandler) OnSessionEnd(ctx context.Context, callIdentifier *CallIdentifier, callInfo *livekit.SIPCallInfo, reason string) {
+	if h.OnSessionEndFunc != nil {
+		h.OnSessionEndFunc(ctx, callIdentifier, callInfo, reason)
+	}
 }
 
 func testInvite(t *testing.T, h Handler, hidden bool, from, to string, test func(tx sip.ClientTransaction)) {
@@ -168,4 +175,94 @@ func TestService_AuthDrop(t *testing.T) {
 	testInvite(t, h, true, expectedFromUser, expectedToUser, func(tx sip.ClientTransaction) {
 		expectNoResponse(t, tx)
 	})
+}
+
+func TestService_OnSessionEnd(t *testing.T) {
+	const (
+		expectedCallID    = "test-call-id"
+		expectedSipCallID = "test-sip-call-id"
+		expectedProjectID = "test-project"
+		expectedReason    = "test-reason"
+	)
+
+	callEnded := make(chan struct{})
+	var receivedCallIdentifier *CallIdentifier
+	var receivedCallInfo *livekit.SIPCallInfo
+	var receivedReason string
+
+	h := &TestHandler{
+		GetAuthCredentialsFunc: func(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error) {
+			return AuthInfo{Result: AuthAccept}, nil
+		},
+		DispatchCallFunc: func(ctx context.Context, info *CallInfo) CallDispatch {
+			return CallDispatch{
+				Result: DispatchAccept,
+				Room: RoomConfig{
+					RoomName: "test-room",
+					Participant: ParticipantConfig{
+						Identity: "test-participant",
+					},
+				},
+			}
+		},
+		OnSessionEndFunc: func(ctx context.Context, callIdentifier *CallIdentifier, callInfo *livekit.SIPCallInfo, reason string) {
+			receivedCallIdentifier = callIdentifier
+			receivedCallInfo = callInfo
+			receivedReason = reason
+			close(callEnded)
+		},
+	}
+
+	// Create a new service
+	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
+
+	mon, err := stats.NewMonitor(&config.Config{MaxCpuUtilization: 0.9})
+	require.NoError(t, err)
+
+	log := logger.NewTestLogger(t)
+	s, err := NewService("", &config.Config{
+		SIPPort:       sipPort,
+		SIPPortListen: sipPort,
+		RTPPort:       rtcconfig.PortRange{Start: testPortRTPMin, End: testPortRTPMax},
+	}, mon, log, func(projectID string) rpc.IOInfoClient { return nil })
+	require.NoError(t, err)
+	require.NotNil(t, s)
+	t.Cleanup(s.Stop)
+
+	s.SetHandler(h)
+	require.NoError(t, s.Start())
+
+	// Call OnSessionEnd directly with test data
+	h.OnSessionEnd(context.Background(), &CallIdentifier{
+		ProjectID: expectedProjectID,
+		CallID:    expectedCallID,
+		SipCallID: expectedSipCallID,
+	}, &livekit.SIPCallInfo{
+		CallId: expectedCallID,
+		ParticipantAttributes: map[string]string{
+			"projectID":       expectedProjectID,
+			AttrSIPCallIDFull: expectedSipCallID,
+		},
+	}, expectedReason)
+
+	// Wait for OnSessionEnd to be called
+	select {
+	case <-callEnded:
+		// Success
+	case <-time.After(time.Second):
+		t.Fatal("OnSessionEnd was not called")
+	}
+
+	// Verify the CallIdentifier fields are correctly populated
+	require.NotNil(t, receivedCallIdentifier, "CallIdentifier should not be nil")
+	require.Equal(t, expectedProjectID, receivedCallIdentifier.ProjectID, "CallIdentifier.ProjectID should match")
+	require.Equal(t, expectedCallID, receivedCallIdentifier.CallID, "CallIdentifier.CallID should match")
+	require.Equal(t, expectedSipCallID, receivedCallIdentifier.SipCallID, "CallIdentifier.SipCallID should match")
+
+	// Verify the CallInfo fields
+	require.NotNil(t, receivedCallInfo, "CallInfo should not be nil")
+	require.Equal(t, expectedProjectID, receivedCallInfo.ParticipantAttributes["projectID"], "CallInfo.ParticipantAttributes[projectID] should match")
+	require.Equal(t, expectedCallID, receivedCallInfo.CallId, "CallInfo.CallId should match")
+	require.Equal(t, expectedSipCallID, receivedCallInfo.ParticipantAttributes[AttrSIPCallIDFull], "CallInfo.ParticipantAttributes[sip.callIDFull] should match")
+	require.Equal(t, expectedReason, receivedReason, "Reason should match")
 }

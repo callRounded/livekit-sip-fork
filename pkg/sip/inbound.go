@@ -309,6 +309,27 @@ func (s *Server) onBye(log *slog.Logger, req *sip.Request, tx sip.ServerTransact
 	}
 }
 
+func (s *Server) OnNoRoute(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	callID := ""
+	if h := req.CallID(); h != nil {
+		callID = h.Value()
+	}
+	from := ""
+	if h := req.From(); h != nil {
+		from = h.Address.String()
+	}
+	to := ""
+	if h := req.To(); h != nil {
+		to = h.Address.String()
+	}
+	s.log.Infow("Inbound SIP request not handled",
+		"method", req.Method.String(),
+		"callID", callID,
+		"from", from,
+		"to", to)
+	tx.Respond(sip.NewResponseFromRequest(req, 405, "Method Not Allowed", nil))
+}
+
 func (s *Server) onNotify(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
 	tag, err := getFromTag(req)
 	if err != nil {
@@ -358,7 +379,9 @@ type inboundCall struct {
 	forwardDTMF atomic.Bool
 	done        atomic.Bool
 	started     core.Fuse
+	stats       Stats
 	jitterBuf   bool
+	projectID   string
 }
 
 func (s *Server) newInboundCall(
@@ -380,9 +403,11 @@ func (s *Server) newInboundCall(
 		state:      state,
 		extraAttrs: extra,
 		dtmf:       make(chan dtmf.Event, 10),
-		lkRoom:     NewRoom(log), // we need it created earlier so that the audio mixer is available for pin prompts
 		jitterBuf:  SelectValueBool(s.conf.EnableJitterBuffer, s.conf.EnableJitterBufferProb),
+		projectID:  "", // Will be set in handleInvite when available
 	}
+	// we need it created earlier so that the audio mixer is available for pin prompts
+	c.lkRoom = NewRoom(log, &c.stats.Room)
 	c.log = c.log.WithValues("jitterBuf", c.jitterBuf)
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	s.cmu.Lock()
@@ -398,6 +423,12 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 	defer c.mon.CallEnd()
 	defer c.close(true, callDropped, "other")
 
+	// Extract and store the SIP call ID from the request
+	if h := req.CallID(); h != nil {
+		c.call.SipCallId = h.Value()
+	}
+
+	// Use custom Rounded options
 	roundedOpts := ""
 	if h := req.GetHeader(roundedOptionsHeader); h != nil {
 		roundedOpts = strings.ToLower(h.Value())
@@ -418,6 +449,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 	})
 	if disp.ProjectID != "" {
 		c.log = c.log.WithValues("projectID", disp.ProjectID)
+		c.projectID = disp.ProjectID
 	}
 	if disp.TrunkID != "" {
 		c.log = c.log.WithValues("sipTrunk", disp.TrunkID)
@@ -578,20 +610,27 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 
 	c.started.Break()
 
-	// Wait for the caller to terminate the call.
-	select {
-	case <-ctx.Done():
-		c.closeWithHangup()
-		return nil
-	case <-c.lkRoom.Closed():
-		c.state.DeferUpdate(func(info *livekit.SIPCallInfo) {
-			info.DisconnectReason = livekit.DisconnectReason_CLIENT_INITIATED
-		})
-		c.close(false, callDropped, "removed")
-		return nil
-	case <-c.media.Timeout():
-		c.closeWithTimeout()
-		return psrpc.NewErrorf(psrpc.DeadlineExceeded, "media timeout")
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	// Wait for the caller to terminate the call. Send regular keep alives
+	for {
+		select {
+		case <-ticker.C:
+			c.log.Debugw("sending keep-alive")
+			c.state.ForceFlush(ctx)
+		case <-ctx.Done():
+			c.closeWithHangup()
+			return nil
+		case <-c.lkRoom.Closed():
+			c.state.DeferUpdate(func(info *livekit.SIPCallInfo) {
+				info.DisconnectReason = livekit.DisconnectReason_CLIENT_INITIATED
+			})
+			c.close(false, callDropped, "removed")
+			return nil
+		case <-c.media.Timeout():
+			c.closeWithTimeout()
+			return psrpc.NewErrorf(psrpc.DeadlineExceeded, "media timeout")
+		}
 	}
 }
 
@@ -610,6 +649,7 @@ func (c *inboundCall) runMediaConn(offerData []byte, enc livekit.SIPMediaEncrypt
 		MediaTimeoutInitial: c.s.conf.MediaTimeoutInitial,
 		MediaTimeout:        c.s.conf.MediaTimeout,
 		EnableJitterBuffer:  c.jitterBuf,
+		Stats:               &c.stats.Port,
 	}, RoomSampleRate)
 	if err != nil {
 		return nil, err
@@ -748,6 +788,7 @@ func (c *inboundCall) pinPrompt(ctx context.Context, trunkID string) (disp CallD
 				})
 				if disp.ProjectID != "" {
 					c.log = c.log.WithValues("projectID", disp.ProjectID)
+					c.projectID = disp.ProjectID
 				}
 				if disp.TrunkID != "" {
 					c.log = c.log.WithValues("sipTrunk", disp.TrunkID)
@@ -784,6 +825,9 @@ func (c *inboundCall) close(error bool, status CallStatus, reason string) {
 	c.mon.CallTerminate(reason)
 	sipCode, sipStatus := status.SIPStatus()
 	log := c.log.WithValues("status", sipCode, "reason", reason)
+	defer func() {
+		log.Infow("call statistics", "stats", c.stats.Load())
+	}()
 	if error {
 		log.Warnw("Closing inbound call with error", nil)
 	} else {
@@ -804,6 +848,15 @@ func (c *inboundCall) close(error bool, status CallStatus, reason string) {
 	c.s.cmu.Unlock()
 
 	c.s.DeregisterTransferSIPParticipant(c.cc.ID())
+
+	// Call the handler asynchronously to avoid blocking
+	if c.s.handler != nil {
+		go c.s.handler.OnSessionEnd(context.Background(), &CallIdentifier{
+			ProjectID: c.projectID,
+			CallID:    c.call.LkCallId,
+			SipCallID: c.call.SipCallId,
+		}, c.state.callInfo, reason)
+	}
 
 	c.cancel()
 }
@@ -966,7 +1019,7 @@ func (c *inboundCall) transferCall(ctx context.Context, transferTo string, heade
 		defer func() {
 			if retErr != nil && !c.done.Load() {
 				c.lkRoom.SwapOutput(w)
-			} else {
+			} else if w != nil {
 				w.Close()
 			}
 		}()
@@ -1169,9 +1222,7 @@ func (c *sipInbound) StartRinging() {
 			case r := <-cancels:
 				close(c.cancelled)
 				_ = tx.Respond(sip.NewResponseFromRequest(r, sip.StatusOK, "OK", nil))
-				c.mu.Lock()
-				c.drop()
-				c.mu.Unlock()
+				c.RespondAndDrop(sip.StatusRequestTerminated, "Request Terminated")
 				return
 			case <-ticker.C:
 			}

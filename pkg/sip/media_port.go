@@ -26,8 +26,8 @@ import (
 	"time"
 
 	"github.com/frostbyte73/core"
-	msdk "github.com/livekit/media-sdk"
 
+	msdk "github.com/livekit/media-sdk"
 	"github.com/livekit/media-sdk/dtmf"
 	"github.com/livekit/media-sdk/rtp"
 	"github.com/livekit/media-sdk/sdp"
@@ -39,18 +39,35 @@ import (
 	"github.com/livekit/sip/pkg/stats"
 )
 
+type PortStats struct {
+	Streams        atomic.Uint64
+	Packets        atomic.Uint64
+	IgnoredPackets atomic.Uint64
+	InputPackets   atomic.Uint64
+
+	MuxPackets atomic.Uint64
+	MuxBytes   atomic.Uint64
+
+	AudioPackets atomic.Uint64
+	AudioBytes   atomic.Uint64
+
+	DTMFPackets atomic.Uint64
+	DTMFBytes   atomic.Uint64
+}
+
 type UDPConn interface {
 	net.Conn
 	ReadFromUDPAddrPort(b []byte) (n int, addr netip.AddrPort, err error)
 	WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error)
 }
 
-func newUDPConn(conn UDPConn) *udpConn {
-	return &udpConn{UDPConn: conn}
+func newUDPConn(log logger.Logger, conn UDPConn) *udpConn {
+	return &udpConn{UDPConn: conn, log: log}
 }
 
 type udpConn struct {
 	UDPConn
+	log logger.Logger
 	src atomic.Pointer[netip.AddrPort]
 	dst atomic.Pointer[netip.AddrPort]
 }
@@ -66,13 +83,23 @@ func (c *udpConn) GetSrc() (netip.AddrPort, bool) {
 
 func (c *udpConn) SetDst(addr netip.AddrPort) {
 	if addr.IsValid() {
-		c.dst.Store(&addr)
+		prev := c.dst.Swap(&addr)
+		if prev == nil || !prev.IsValid() {
+			c.log.Infow("setting media destination", "addr", addr.String())
+		} else if *prev != addr {
+			c.log.Infow("changing media destination", "addr", addr.String())
+		}
 	}
 }
 
 func (c *udpConn) Read(b []byte) (n int, err error) {
 	n, addr, err := c.ReadFromUDPAddrPort(b)
-	c.src.Store(&addr)
+	prev := c.src.Swap(&addr)
+	if prev == nil || !prev.IsValid() {
+		c.log.Infow("setting media source", "addr", addr.String())
+	} else if *prev != addr {
+		c.log.Infow("changing media source", "addr", addr.String())
+	}
 	return n, err
 }
 
@@ -94,6 +121,7 @@ type MediaOptions struct {
 	Ports               rtcconfig.PortRange
 	MediaTimeoutInitial time.Duration
 	MediaTimeout        time.Duration
+	Stats               *PortStats
 	EnableJitterBuffer  bool
 }
 
@@ -111,6 +139,9 @@ func NewMediaPortWith(log logger.Logger, mon *stats.CallMonitor, conn UDPConn, o
 	if opts.MediaTimeout <= 0 {
 		opts.MediaTimeout = 15 * time.Second
 	}
+	if opts.Stats == nil {
+		opts.Stats = &PortStats{}
+	}
 	if conn == nil {
 		c, err := rtp.ListenUDPPortRange(opts.Ports.Start, opts.Ports.End, netip.AddrFrom4([4]byte{0, 0, 0, 0}))
 		if err != nil {
@@ -127,9 +158,10 @@ func NewMediaPortWith(log logger.Logger, mon *stats.CallMonitor, conn UDPConn, o
 		mediaTimeout:  mediaTimeout,
 		timeoutReset:  make(chan struct{}, 1),
 		jitterEnabled: opts.EnableJitterBuffer,
-		port:          newUDPConn(conn),
+		port:          newUDPConn(log, conn),
 		audioOut:      msdk.NewSwitchWriter(sampleRate),
 		audioIn:       msdk.NewSwitchWriter(sampleRate),
+		stats:         opts.Stats,
 	}
 	go p.timeoutLoop(func() {
 		close(mediaTimeout)
@@ -151,13 +183,14 @@ type MediaPort struct {
 	timeoutStart     atomic.Pointer[time.Time]
 	timeoutReset     chan struct{}
 	closed           core.Fuse
+	stats            *PortStats
 	dtmfAudioEnabled bool
 	jitterEnabled    bool
 
 	mu           sync.Mutex
 	conf         *MediaConf
 	sess         rtp.Session
-	hnd          atomic.Pointer[rtp.Handler]
+	hnd          atomic.Pointer[rtp.HandlerCloser]
 	dtmfOutRTP   *rtp.Stream
 	dtmfOutAudio msdk.PCM16Writer
 
@@ -269,6 +302,11 @@ func (p *MediaPort) Close() {
 			_ = p.sess.Close()
 		}
 		_ = p.port.Close()
+
+		hnd := p.hnd.Load()
+		if hnd != nil {
+			(*hnd).Close()
+		}
 	})
 }
 
@@ -387,6 +425,7 @@ func (p *MediaPort) rtpLoop(sess rtp.Session) {
 			}
 			return
 		}
+		p.stats.Streams.Add(1)
 		p.mediaReceived.Break()
 		log := p.log.WithValues("ssrc", ssrc)
 		log.Infow("accepting RTP stream")
@@ -413,22 +452,27 @@ func (p *MediaPort) rtpReadLoop(log logger.Logger, r rtp.ReadStream) {
 			return
 		}
 		p.packetCount.Add(1)
+		p.stats.Packets.Add(1)
 		if n > rtp.MTUSize {
 			overflow = true
 			if !overflow {
 				log.Errorw("RTP packet is larger than MTU limit", nil, "payloadSize", n)
 			}
+			p.stats.IgnoredPackets.Add(1)
 			continue // ignore partial messages
 		}
 
 		ptr := p.hnd.Load()
 		if ptr == nil {
+			p.stats.IgnoredPackets.Add(1)
 			continue
 		}
 		hnd := *ptr
 		if hnd == nil {
+			p.stats.IgnoredPackets.Add(1)
 			continue
 		}
+		p.stats.InputPackets.Add(1)
 		err = hnd.HandleRTP(&h, buf[:n])
 		if err != nil {
 			if pipeline == "" {
@@ -476,7 +520,7 @@ func (p *MediaPort) setupOutput() error {
 		if p.dtmfAudioEnabled {
 			// Add separate mixer for DTMF audio.
 			// TODO: optimize, if we'll ever need this code path
-			mix := mixer.NewMixer(audioOut, rtp.DefFrameDur)
+			mix := mixer.NewMixer(audioOut, rtp.DefFrameDur, nil)
 			audioOut = mix.NewInput()
 			p.dtmfOutAudio = mix.NewInput()
 		}
@@ -495,21 +539,31 @@ func (p *MediaPort) setupInput() {
 
 	mux := rtp.NewMux(nil)
 	mux.SetDefault(newRTPStatsHandler(p.mon, "", nil))
-	mux.Register(p.conf.Audio.Type, newRTPStatsHandler(p.mon, p.conf.Audio.Codec.Info().SDPName, audioHandler))
+	mux.Register(
+		p.conf.Audio.Type, newRTPHandlerCount(
+			newRTPStatsHandler(p.mon, p.conf.Audio.Codec.Info().SDPName, audioHandler),
+			&p.stats.AudioPackets, &p.stats.AudioBytes,
+		),
+	)
 	if p.conf.Audio.DTMFType != 0 {
-		mux.Register(p.conf.Audio.DTMFType, newRTPStatsHandler(p.mon, dtmf.SDPName, rtp.HandlerFunc(func(h *rtp.Header, payload []byte) error {
-			ptr := p.dtmfIn.Load()
-			if ptr == nil {
-				return nil
-			}
-			fnc := *ptr
-			if ev, ok := dtmf.DecodeRTP(h, payload); ok && fnc != nil {
-				fnc(ev)
-			}
-			return nil
-		})))
+		mux.Register(
+			p.conf.Audio.DTMFType, newRTPHandlerCount(
+				newRTPStatsHandler(p.mon, dtmf.SDPName, rtp.HandlerFunc(func(h *rtp.Header, payload []byte) error {
+					ptr := p.dtmfIn.Load()
+					if ptr == nil {
+						return nil
+					}
+					fnc := *ptr
+					if ev, ok := dtmf.DecodeRTP(h, payload); ok && fnc != nil {
+						fnc(ev)
+					}
+					return nil
+				})),
+				&p.stats.DTMFPackets, &p.stats.DTMFBytes,
+			),
+		)
 	}
-	var hnd rtp.Handler = mux
+	var hnd rtp.HandlerCloser = rtp.NewNopCloser(newRTPHandlerCount(mux, &p.stats.MuxPackets, &p.stats.MuxBytes))
 	if p.jitterEnabled {
 		hnd = rtp.HandleJitter(hnd)
 	}

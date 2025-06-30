@@ -99,6 +99,12 @@ type CallDispatch struct {
 	MediaEncryption     livekit.SIPMediaEncryption
 }
 
+type CallIdentifier struct {
+	ProjectID string
+	CallID    string
+	SipCallID string
+}
+
 type Handler interface {
 	GetAuthCredentials(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error)
 	DispatchCall(ctx context.Context, info *CallInfo) CallDispatch
@@ -106,6 +112,8 @@ type Handler interface {
 
 	RegisterTransferSIPParticipantTopic(sipCallId string) error
 	DeregisterTransferSIPParticipantTopic(sipCallId string)
+
+	OnSessionEnd(ctx context.Context, callIdentifier *CallIdentifier, callInfo *livekit.SIPCallInfo, reason string)
 }
 
 type Server struct {
@@ -261,6 +269,7 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, unhandled Requ
 	s.sipSrv.OnInvite(s.onInvite)
 	s.sipSrv.OnBye(s.onBye)
 	s.sipSrv.OnNotify(s.onNotify)
+	s.sipSrv.OnNoRoute(s.OnNoRoute)
 	s.sipUnhandled = unhandled
 
 	// Ignore ACKs

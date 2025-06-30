@@ -73,7 +73,9 @@ type outboundCall struct {
 	started   core.Fuse
 	stopped   core.Fuse
 	closing   core.Fuse
+	stats     Stats
 	jitterBuf bool
+	projectID string
 
 	mu       sync.RWMutex
 	mon      *stats.CallMonitor
@@ -82,7 +84,7 @@ type outboundCall struct {
 	sipConf  sipOutboundConfig
 }
 
-func (c *Client) newCall(ctx context.Context, conf *config.Config, log logger.Logger, id LocalTag, room RoomConfig, sipConf sipOutboundConfig, state *CallState) (*outboundCall, error) {
+func (c *Client) newCall(ctx context.Context, conf *config.Config, log logger.Logger, id LocalTag, room RoomConfig, sipConf sipOutboundConfig, state *CallState, projectID string) (*outboundCall, error) {
 	if sipConf.maxCallDuration <= 0 || sipConf.maxCallDuration > maxCallDuration {
 		sipConf.maxCallDuration = maxCallDuration
 	}
@@ -103,8 +105,9 @@ func (c *Client) newCall(ctx context.Context, conf *config.Config, log logger.Lo
 		sipConf:   sipConf,
 		state:     state,
 		jitterBuf: jitterBuf,
+		projectID: projectID,
 	}
-	c.log = c.log.WithValues("jitterBuf", call.jitterBuf)
+	call.log = call.log.WithValues("jitterBuf", call.jitterBuf)
 	call.cc = c.newOutbound(log, id, URI{
 		User:      sipConf.from,
 		Host:      sipConf.host,
@@ -131,6 +134,7 @@ func (c *Client) newCall(ctx context.Context, conf *config.Config, log logger.Lo
 		MediaTimeoutInitial: c.conf.MediaTimeoutInitial,
 		MediaTimeout:        c.conf.MediaTimeout,
 		EnableJitterBuffer:  call.jitterBuf,
+		Stats:               &call.stats.Port,
 	}, RoomSampleRate)
 	if err != nil {
 		call.close(errors.Wrap(err, "media failed"), callDropped, "media-failed", livekit.DisconnectReason_UNKNOWN_REASON)
@@ -163,6 +167,7 @@ func (c *outboundCall) ensureClosed(ctx context.Context) {
 				info.ParticipantAttributes = p.Attributes()
 			}
 		}
+		info.EndedAtNs = time.Now().UnixNano()
 	})
 }
 
@@ -203,17 +208,25 @@ func (c *outboundCall) Dial(ctx context.Context) error {
 func (c *outboundCall) WaitClose(ctx context.Context) error {
 	ctx = context.WithoutCancel(ctx)
 	defer c.ensureClosed(ctx)
-	select {
-	case <-c.Disconnected():
-		c.CloseWithReason(callDropped, "removed", livekit.DisconnectReason_CLIENT_INITIATED)
-		return nil
-	case <-c.media.Timeout():
-		c.closeWithTimeout()
-		err := psrpc.NewErrorf(psrpc.DeadlineExceeded, "media timeout")
-		c.setErrStatus(ctx, err)
-		return err
-	case <-c.Closed():
-		return nil
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			c.log.Debugw("sending keep-alive")
+			c.state.ForceFlush(ctx)
+		case <-c.Disconnected():
+			c.CloseWithReason(callDropped, "removed", livekit.DisconnectReason_CLIENT_INITIATED)
+			return nil
+		case <-c.media.Timeout():
+			c.closeWithTimeout()
+			err := psrpc.NewErrorf(psrpc.DeadlineExceeded, "media timeout")
+			c.setErrStatus(ctx, err)
+			return err
+		case <-c.Closed():
+			return nil
+		}
 	}
 }
 
@@ -278,6 +291,8 @@ func (c *outboundCall) close(err error, status CallStatus, description string, r
 
 		c.stopSIP(description)
 
+		c.log.Infow("call statistics", "stats", c.stats.Load())
+
 		c.c.cmu.Lock()
 		delete(c.c.activeCalls, c.cc.ID())
 		if tag := c.cc.Tag(); tag != "" {
@@ -286,6 +301,15 @@ func (c *outboundCall) close(err error, status CallStatus, description string, r
 		c.c.cmu.Unlock()
 
 		c.c.DeregisterTransferSIPParticipant(string(c.cc.ID()))
+
+		// Call the handler asynchronously to avoid blocking
+		if c.c.handler != nil {
+			go c.c.handler.OnSessionEnd(context.Background(), &CallIdentifier{
+				ProjectID: c.projectID,
+				CallID:    c.state.callInfo.CallId,
+				SipCallID: c.cc.CallID(),
+			}, c.state.callInfo, description)
+		}
 	})
 }
 
@@ -341,7 +365,7 @@ func (c *outboundCall) connectToRoom(ctx context.Context, lkNew RoomConfig) erro
 
 	attrs[livekit.AttrSIPCallStatus] = CallDialing.Attribute()
 	lkNew.Participant.Attributes = attrs
-	r := NewRoom(c.log)
+	r := NewRoom(c.log, &c.stats.Room)
 	if err := r.Connect(c.c.conf, lkNew); err != nil {
 		return err
 	}
