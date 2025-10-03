@@ -176,7 +176,7 @@ func (s *Service) SetHandler(handler Handler) {
 }
 
 func (s *Service) Start() error {
-	s.log.Debugw("starting sip service", "version", version.Version)
+	s.log.Infow("SIP service starting", "version", version.Version)
 	for name, enabled := range s.conf.Codecs {
 		if enabled {
 			s.log.Warnw("codec enabled", nil, "name", name)

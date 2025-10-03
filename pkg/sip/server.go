@@ -171,7 +171,7 @@ func (s *Server) startUDP(addr netip.AddrPort) error {
 		return fmt.Errorf("cannot listen on the UDP signaling port %d: %w", s.conf.SIPPortListen, err)
 	}
 	s.sipListeners = append(s.sipListeners, lis)
-	s.log.Infow("sip signaling listening on",
+	s.log.Infow("SIP signaling listening on UDP",
 		"local", s.sconf.SignalingIPLocal, "external", s.sconf.SignalingIP,
 		"port", addr.Port(), "announce-port", s.conf.SIPPort,
 		"proto", "udp",
@@ -194,7 +194,7 @@ func (s *Server) startTCP(addr netip.AddrPort) error {
 		return fmt.Errorf("cannot listen on the TCP signaling port %d: %w", s.conf.SIPPortListen, err)
 	}
 	s.sipListeners = append(s.sipListeners, lis)
-	s.log.Infow("sip signaling listening on",
+	s.log.Infow("SIP signaling listening on TCP",
 		"local", s.sconf.SignalingIPLocal, "external", s.sconf.SignalingIP,
 		"port", addr.Port(), "announce-port", s.conf.SIPPort,
 		"proto", "tcp",
@@ -218,7 +218,7 @@ func (s *Server) startTLS(addr netip.AddrPort, conf *tls.Config) error {
 	}
 	lis := tls.NewListener(tlis, conf)
 	s.sipListeners = append(s.sipListeners, lis)
-	s.log.Infow("sip signaling listening on",
+	s.log.Infow("SIP signaling listening on TLS",
 		"local", s.sconf.SignalingIPLocal, "external", s.sconf.SignalingIP,
 		"port", addr.Port(), "announce-port", s.conf.TLS.Port,
 		"proto", "tls",
@@ -236,7 +236,7 @@ type RequestHandler func(req *sip.Request, tx sip.ServerTransaction) bool
 
 func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, unhandled RequestHandler) error {
 	s.sconf = sc
-	s.log.Infow("server starting", "local", s.sconf.SignalingIPLocal, "external", s.sconf.SignalingIP)
+	s.log.Infow("SIP server starting", "local", s.sconf.SignalingIPLocal, "external", s.sconf.SignalingIP)
 
 	if agent == nil {
 		ua, err := sipgo.NewUA(
@@ -306,6 +306,7 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, unhandled Requ
 }
 
 func (s *Server) Stop() {
+	s.log.Infow("SIP server stopping")
 	s.closing.Break()
 	s.cmu.Lock()
 	calls := maps.Values(s.activeCalls)
@@ -320,6 +321,7 @@ func (s *Server) Stop() {
 	for _, l := range s.sipListeners {
 		_ = l.Close()
 	}
+	s.log.Infow("SIP server stopped")
 }
 
 func (s *Server) RegisterTransferSIPParticipant(sipCallID LocalTag, i *inboundCall) error {

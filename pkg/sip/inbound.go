@@ -60,6 +60,59 @@ const (
 	roundedOptionsNoRinging = "no-ringing"
 )
 
+// logSIPMessage logs a SIP message in Asterisk-style format
+func (s *Server) logSIPMessage(action string, msg interface{}, peer string) {
+	var msgStr string
+	var msgSize int
+	var destination string
+	var method string
+	
+	switch m := msg.(type) {
+	case *sip.Request:
+		msgStr = m.String()
+		msgSize = len(msgStr)
+		destination = m.Destination()
+		method = m.Method.String()
+		s.log.Infow(fmt.Sprintf("📤 %s SIP %s (%d bytes) → %s:%s", action, method, msgSize, m.Transport(), peer))
+	case *sip.Response:
+		msgStr = m.String()
+		msgSize = len(msgStr)
+		destination = m.Destination()
+		method = fmt.Sprintf("%d %s", m.StatusCode, m.Reason)
+		s.log.Infow(fmt.Sprintf("📤 %s SIP %s (%d bytes) → %s:%s", action, method, msgSize, m.Transport(), peer))
+	default:
+		return
+	}
+	
+	// Log destination IP address with emoji
+	s.log.Infow(fmt.Sprintf("🌐 SIP Destination: %s ← %s", destination, peer))
+	
+	// Log the full SIP message with better formatting
+	s.logSIPMessageFormatted(msgStr)
+}
+
+func (s *Server) logSIPMessageFormatted(msgStr string) {
+	// Format SIP message similar to Asterisk style
+	lines := strings.Split(msgStr, "\r\n")
+	
+	s.log.Infow("📋 SIP Message Details:")
+	for i, line := range lines {
+		if line == "" {
+			// Empty line indicates end of headers, start of body
+			s.log.Infow("")
+			continue
+		}
+		
+		if i == 0 {
+			// First line is the request/response line
+			s.log.Infow(fmt.Sprintf("  %s", line))
+		} else {
+			// Header lines
+			s.log.Infow(fmt.Sprintf("  %s", line))
+		}
+	}
+}
+
 func (s *Server) getInvite(from string) *inProgressInvite {
 	s.imu.Lock()
 	defer s.imu.Unlock()
@@ -104,6 +157,7 @@ func (s *Server) handleInviteAuth(log logger.Logger, req *sip.Request, tx sip.Se
 
 	cred, err := digest.ParseCredentials(h.Value())
 	if err != nil {
+		log.Warnw("SIP authentication failed - bad credentials format", err)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Bad credentials", nil))
 		return false
 	}
@@ -121,6 +175,7 @@ func (s *Server) handleInviteAuth(log logger.Logger, req *sip.Request, tx sip.Se
 	}
 
 	if cred.Response != digCred.Response {
+		log.Warnw("SIP authentication failed - invalid credentials", nil, "username", cred.Username)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 401, "Unauthorized", nil))
 		return false
 	}
@@ -129,6 +184,22 @@ func (s *Server) handleInviteAuth(log logger.Logger, req *sip.Request, tx sip.Se
 }
 
 func (s *Server) onInvite(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	// Log incoming INVITE request
+	s.log.Infow(fmt.Sprintf("📞 SIP INVITE received from %s", req.From().String()),
+		"method", req.Method.String(),
+		"from", req.From().String(),
+		"to", req.To().String(),
+		"callID", req.CallID().Value(),
+		"cseq", req.CSeq().SeqNo,
+		"source", req.Source(),
+		"destination", req.Destination(),
+		"transport", req.Transport(),
+		"userAgent", req.GetHeader("User-Agent").Value(),
+	)
+	
+	// Asterisk-style SIP message logging
+	s.logSIPMessage("Receiving", req, req.Source())
+	
 	// Error processed in defer
 	_ = s.processInvite(req, tx)
 }
@@ -183,6 +254,7 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	log.Infow("processing invite")
 
 	if err := cc.ValidateInvite(); err != nil {
+		log.Warnw(fmt.Sprintf("❌ SIP INVITE validation failed for call %s", callID), err)
 		if s.conf.HideInboundPort {
 			cc.Drop()
 		} else {
@@ -225,7 +297,7 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 	r, err := s.handler.GetAuthCredentials(ctx, callInfo)
 	if err != nil {
 		cmon.InviteErrorShort("auth-error")
-		log.Warnw("Rejecting inbound, auth check failed", err)
+		log.Warnw(fmt.Sprintf("🔐 SIP INVITE auth check failed for call %s", callID), err)
 		cc.RespondAndDrop(sip.StatusServiceUnavailable, "Try again later")
 		return psrpc.NewError(psrpc.PermissionDenied, errors.Wrap(err, "rejecting inbound, auth check failed"))
 	}
@@ -276,16 +348,47 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 
 	call = s.newInboundCall(log, cmon, cc, callInfo, state, nil)
 	call.joinDur = joinDur
+	
+	log.Infow(fmt.Sprintf("🎯 SIP call created: %s → %s", from.String(), to.String()),
+		"callID", callID,
+		"from", from.String(),
+		"to", to.String(),
+		"trunkID", r.TrunkID,
+		"projectID", r.ProjectID,
+	)
+	
 	return call.handleInvite(call.ctx, req, r.TrunkID, s.conf)
 }
 
 func (s *Server) onOptions(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	s.log.Debugw(fmt.Sprintf("🔍 SIP OPTIONS received from %s", req.From().String()),
+		"from", req.From().String(),
+		"to", req.To().String(),
+		"callID", req.CallID().Value(),
+		"source", req.Source(),
+	)
+	
+	// Asterisk-style SIP message logging
+	s.logSIPMessage("Receiving", req, req.Source())
+	
 	_ = tx.Respond(sip.NewResponseFromRequest(req, 200, "OK", nil))
 }
 
 func (s *Server) onBye(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	s.log.Infow(fmt.Sprintf("📴 SIP BYE received from %s", req.From().String()),
+		"from", req.From().String(),
+		"to", req.To().String(),
+		"callID", req.CallID().Value(),
+		"cseq", req.CSeq().SeqNo,
+		"source", req.Source(),
+	)
+	
+	// Asterisk-style SIP message logging
+	s.logSIPMessage("Receiving", req, req.Source())
+	
 	tag, err := getFromTag(req)
 	if err != nil {
+		s.log.Warnw("SIP BYE missing From tag", err)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "", nil))
 		return
 	}
@@ -294,7 +397,7 @@ func (s *Server) onBye(log *slog.Logger, req *sip.Request, tx sip.ServerTransact
 	c := s.activeCalls[tag]
 	s.cmu.RUnlock()
 	if c != nil {
-		c.log.Infow("BYE")
+		c.log.Infow("SIP BYE accepted for active call")
 		c.cc.AcceptBye(req, tx)
 		_ = c.Close()
 		return
@@ -304,14 +407,27 @@ func (s *Server) onBye(log *slog.Logger, req *sip.Request, tx sip.ServerTransact
 		ok = s.sipUnhandled(req, tx)
 	}
 	if !ok {
-		s.log.Infow("BYE for non-existent call", "sipTag", tag)
+		s.log.Warnw("SIP BYE for non-existent call", nil, "sipTag", tag)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call does not exist", nil))
 	}
 }
 
 func (s *Server) onNotify(log *slog.Logger, req *sip.Request, tx sip.ServerTransaction) {
+	s.log.Debugw(fmt.Sprintf("🔔 SIP NOTIFY received from %s", req.From().String()),
+		"from", req.From().String(),
+		"to", req.To().String(),
+		"callID", req.CallID().Value(),
+		"cseq", req.CSeq().SeqNo,
+		"source", req.Source(),
+		"event", req.GetHeader("Event").Value(),
+	)
+	
+	// Asterisk-style SIP message logging
+	s.logSIPMessage("Receiving", req, req.Source())
+	
 	tag, err := getFromTag(req)
 	if err != nil {
+		s.log.Warnw("SIP NOTIFY missing From tag", err)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, 400, "", nil))
 		return
 	}
@@ -320,10 +436,11 @@ func (s *Server) onNotify(log *slog.Logger, req *sip.Request, tx sip.ServerTrans
 	c := s.activeCalls[tag]
 	s.cmu.RUnlock()
 	if c != nil {
-		c.log.Infow("NOTIFY")
+		c.log.Debugw("SIP NOTIFY processing for active call")
 		err := c.cc.handleNotify(req, tx)
 
 		code, msg := sipCodeAndMessageFromError(err)
+		c.log.Debugw("SIP NOTIFY response", "code", code, "message", msg)
 
 		tx.Respond(sip.NewResponseFromRequest(req, code, msg, nil))
 
@@ -334,7 +451,7 @@ func (s *Server) onNotify(log *slog.Logger, req *sip.Request, tx sip.ServerTrans
 		ok = s.sipUnhandled(req, tx)
 	}
 	if !ok {
-		s.log.Infow("NOTIFY for non-existent call")
+		s.log.Warnw("SIP NOTIFY for non-existent call", nil, "sipTag", tag)
 		_ = tx.Respond(sip.NewResponseFromRequest(req, sip.StatusCallTransactionDoesNotExists, "Call does not exist", nil))
 	}
 }
@@ -597,7 +714,11 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 
 func (c *inboundCall) runMediaConn(offerData []byte, enc livekit.SIPMediaEncryption, conf *config.Config, features []livekit.SIPFeature) (answerData []byte, _ error) {
 	c.mon.SDPSize(len(offerData), true)
-	c.log.Debugw("SDP offer", "sdp", string(offerData))
+	c.log.Infow("SIP SDP offer received",
+		"callID", c.cc.CallID(),
+		"sdpSize", len(offerData),
+		"sdp", string(offerData),
+	)
 	e, err := sdpEncryption(enc)
 	if err != nil {
 		c.log.Errorw("Cannot parse encryption", err)
@@ -628,12 +749,17 @@ func (c *inboundCall) runMediaConn(offerData []byte, enc livekit.SIPMediaEncrypt
 		return nil, err
 	}
 	c.mon.SDPSize(len(answerData), false)
-	c.log.Debugw("SDP answer", "sdp", string(answerData))
+	c.log.Infow("SIP SDP answer generated",
+		"callID", c.cc.CallID(),
+		"sdpSize", len(answerData),
+		"sdp", string(answerData),
+	)
 
 	mconf.Processor = c.s.handler.GetMediaProcessor(features)
 	if err = c.media.SetConfig(mconf); err != nil {
 		return nil, err
 	}
+
 	if mconf.Audio.DTMFType != 0 {
 		c.media.HandleDTMF(c.handleDTMF)
 	}
@@ -785,12 +911,12 @@ func (c *inboundCall) close(error bool, status CallStatus, reason string) {
 	sipCode, sipStatus := status.SIPStatus()
 	log := c.log.WithValues("status", sipCode, "reason", reason)
 	if error {
-		log.Warnw("Closing inbound call with error", nil)
+		log.Warnw("SIP inbound call closing with error", nil, "callID", c.cc.CallID())
 	} else {
-		log.Infow("Closing inbound call")
+		log.Infow("SIP inbound call closing", "callID", c.cc.CallID())
 	}
 	if status != callFlood {
-		defer log.Infow("Inbound call closed")
+		defer log.Infow("SIP inbound call closed", "callID", c.cc.CallID())
 	}
 
 	c.closeMedia()
@@ -933,6 +1059,12 @@ func (c *inboundCall) playAudio(ctx context.Context, frames []msdk.PCM16Sample) 
 }
 
 func (c *inboundCall) handleDTMF(tone dtmf.Event) {
+	c.log.Debugw(fmt.Sprintf("🔢 SIP DTMF received: '%s' (code: %d)", string([]byte{tone.Digit}), tone.Code),
+		"callID", c.cc.CallID(),
+		"digit", string([]byte{tone.Digit}),
+		"code", tone.Code,
+		"forwarding", c.forwardDTMF.Load(),
+	)
 	if c.forwardDTMF.Load() {
 		_ = c.lkRoom.SendData(&livekit.SipDTMF{
 			Code:  uint32(tone.Code),
@@ -944,6 +1076,7 @@ func (c *inboundCall) handleDTMF(tone dtmf.Event) {
 	select {
 	case c.dtmf <- tone:
 	default:
+		c.log.Warnw("SIP DTMF buffer full, dropping tone", nil, "callID", c.cc.CallID())
 	}
 }
 
@@ -1081,6 +1214,19 @@ func (c *sipInbound) respond(status sip.StatusCode, reason string) {
 
 	resp := sip.NewResponseFromRequest(c.invite, status, reason, nil)
 	resp.AppendHeader(sip.NewHeader("Allow", "INVITE, ACK, CANCEL, BYE, NOTIFY, REFER, MESSAGE, OPTIONS, INFO, SUBSCRIBE"))
+
+	c.s.log.Infow("SIP response sent",
+		"status", status,
+		"reason", reason,
+		"callID", c.callID,
+		"from", c.from.String(),
+		"to", c.to.String(),
+		"cseq", c.invite.CSeq().SeqNo,
+		"destination", resp.Destination(),
+	)
+
+	// Asterisk-style SIP message logging
+	c.s.logSIPMessage("Transmitting", resp, c.invite.Source())
 
 	_ = c.inviteTx.Respond(resp)
 }
@@ -1228,6 +1374,20 @@ func (c *sipInbound) Accept(ctx context.Context, sdpData []byte, headers map[str
 		r.AppendHeader(sip.NewHeader(k, v))
 	}
 	c.stopRinging()
+	
+	c.s.log.Infow(fmt.Sprintf("✅ SIP 200 OK sent to %s", c.from.String()),
+		"callID", c.callID,
+		"from", c.from.String(),
+		"to", c.to.String(),
+		"cseq", c.invite.CSeq().SeqNo,
+		"sdpSize", len(sdpData),
+		"headers", len(headers),
+		"destination", r.Destination(),
+	)
+	
+	// Asterisk-style SIP message logging
+	c.s.logSIPMessage("Transmitting", r, c.invite.Source())
+	
 	if err := c.inviteTx.Respond(r); err != nil {
 		return err
 	}

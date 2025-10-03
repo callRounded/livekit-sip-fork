@@ -74,7 +74,7 @@ func NewClient(region string, conf *config.Config, log logger.Logger, mon *stats
 
 func (c *Client) Start(agent *sipgo.UserAgent, sc *ServiceConfig) error {
 	c.sconf = sc
-	c.log.Infow("client starting", "local", c.sconf.SignalingIPLocal, "external", c.sconf.SignalingIP)
+	c.log.Infow("SIP client starting", "local", c.sconf.SignalingIPLocal, "external", c.sconf.SignalingIP)
 
 	if agent == nil {
 		ua, err := sipgo.NewUA(
@@ -100,6 +100,7 @@ func (c *Client) Start(agent *sipgo.UserAgent, sc *ServiceConfig) error {
 }
 
 func (c *Client) Stop() {
+	c.log.Infow("SIP client stopping")
 	c.closing.Break()
 	c.cmu.Lock()
 	calls := maps.Values(c.activeCalls)
@@ -113,6 +114,7 @@ func (c *Client) Stop() {
 		c.sipCli.Close()
 		c.sipCli = nil
 	}
+	c.log.Infow("SIP client stopped")
 }
 
 func (c *Client) SetHandler(handler Handler) {
