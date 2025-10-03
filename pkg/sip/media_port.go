@@ -17,9 +17,11 @@ package sip
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -81,7 +83,54 @@ func (c *udpConn) Write(b []byte) (n int, err error) {
 	if dst == nil {
 		return len(b), nil // ignore
 	}
+	
+	// Log RTP packet destination only if DEBUG_RTP environment variable is set
+	if os.Getenv("DEBUG_RTP") == "true" {
+		// Note: This shows the SDP destination. If it's a private IP, the packet will be sent to the public IP instead.
+		if isPrivateIP(dst.Addr().String()) {
+			fmt.Printf("📤 RTP packet sent to destination: %s (size: %d bytes) [SDP shows private IP, NAT will translate to public IP]\n", dst.String(), len(b))
+		} else {
+			fmt.Printf("📤 RTP packet sent to destination: %s (size: %d bytes)\n", dst.String(), len(b))
+		}
+	}
+	
 	return c.WriteToUDPAddrPort(b, *dst)
+}
+
+// isPrivateIP checks if the given IP address is a private IP address
+func isPrivateIP(ipStr string) bool {
+	ip := net.ParseIP(ipStr)
+	if ip == nil {
+		return false
+	}
+	
+	// Check for private IP ranges
+	if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		return true
+	}
+	
+	ipv4 := ip.To4()
+	if ipv4 != nil {
+		// Check for private IPv4 ranges
+		// 10.0.0.0/8
+		if ipv4[0] == 10 {
+			return true
+		}
+		// 172.16.0.0/12
+		if ipv4[0] == 172 && ipv4[1] >= 16 && ipv4[1] <= 31 {
+			return true
+		}
+		// 192.168.0.0/16
+		if ipv4[0] == 192 && ipv4[1] == 168 {
+			return true
+		}
+		// 169.254.0.0/16 (link-local)
+		if ipv4[0] == 169 && ipv4[1] == 254 {
+			return true
+		}
+	}
+	
+	return false
 }
 
 type MediaConf struct {
@@ -383,13 +432,13 @@ func (p *MediaPort) rtpLoop(sess rtp.Session) {
 		r, ssrc, err := sess.AcceptStream()
 		if err != nil {
 			if !errors.Is(err, net.ErrClosed) && !strings.Contains(err.Error(), "closed") {
-				p.log.Errorw("cannot accept RTP stream", err)
+				p.log.Errorw("❌ RTP stream accept failed", err)
 			}
 			return
 		}
 		p.mediaReceived.Break()
 		log := p.log.WithValues("ssrc", ssrc)
-		log.Infow("accepting RTP stream")
+		log.Infow(fmt.Sprintf("🎵 RTP stream accepted (SSRC: %d)", ssrc))
 		go p.rtpReadLoop(log, r)
 	}
 }
@@ -402,21 +451,35 @@ func (p *MediaPort) rtpReadLoop(log logger.Logger, r rtp.ReadStream) {
 		h        rtp.Header
 		pipeline string
 		errorCnt int
+		packetCount uint64
 	)
 	for {
 		h = rtp.Header{}
 		n, err := r.ReadRTP(&h, buf)
 		if err == io.EOF {
+			log.Infow("🔚 RTP stream ended (EOF)")
 			return
 		} else if err != nil {
-			log.Errorw("read RTP failed", err)
+			log.Errorw("❌ RTP read failed", err)
 			return
 		}
-		p.packetCount.Add(1)
+		packetCount = p.packetCount.Add(1)
+		
+		// Log first few packets and then periodically
+		if packetCount <= 5 || packetCount%100 == 0 {
+			log.Debugw(fmt.Sprintf("📦 RTP packet #%d received", packetCount),
+				"payloadType", h.PayloadType,
+				"sequenceNumber", h.SequenceNumber,
+				"timestamp", h.Timestamp,
+				"payloadSize", n,
+				"ssrc", h.SSRC,
+			)
+		}
+		
 		if n > rtp.MTUSize {
 			overflow = true
 			if !overflow {
-				log.Errorw("RTP packet is larger than MTU limit", nil, "payloadSize", n)
+				log.Errorw("⚠️ RTP packet exceeds MTU limit", nil, "payloadSize", n, "mtu", rtp.MTUSize)
 			}
 			continue // ignore partial messages
 		}
@@ -440,10 +503,10 @@ func (p *MediaPort) rtpReadLoop(log logger.Logger, r rtp.ReadStream) {
 				"pipeline", pipeline,
 				"errorCount", errorCnt,
 			)
-			log.Debugw("handle RTP failed", "error", err)
+			log.Debugw("🔧 RTP processing failed", "error", err)
 			errorCnt++
 			if errorCnt >= maxErrors {
-				log.Errorw("killing RTP loop due to persisted errors", err)
+				log.Errorw("💀 RTP loop terminated due to persistent errors", err)
 				return
 			}
 			continue

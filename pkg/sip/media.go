@@ -16,6 +16,8 @@ package sip
 
 import (
 	"fmt"
+	"log/slog"
+	"os"
 	"strconv"
 
 	prtp "github.com/pion/rtp"
@@ -41,6 +43,7 @@ type rtpStatsHandler struct {
 	h   rtp.Handler
 	typ string
 	mon *stats.CallMonitor
+	log *slog.Logger
 }
 
 func (r *rtpStatsHandler) String() string {
@@ -55,6 +58,21 @@ func (r *rtpStatsHandler) HandleRTP(h *rtp.Header, payload []byte) error {
 		}
 		r.mon.RTPPacketRecv(typ)
 	}
+	
+	// Enhanced RTP packet logging (only if DEBUG_RTP is enabled)
+	if r.log != nil && os.Getenv("DEBUG_RTP") == "true" {
+		r.log.Info("📥 RTP packet received from SIP client",
+			"type", r.typ,
+			"payloadType", h.PayloadType,
+			"sequenceNumber", h.SequenceNumber,
+			"timestamp", h.Timestamp,
+			"payloadSize", len(payload),
+			"ssrc", h.SSRC,
+			"marker", h.Marker,
+			"direction", "incoming",
+		)
+	}
+	
 	return r.h.HandleRTP(h, payload)
 }
 
@@ -66,6 +84,7 @@ type rtpStatsWriter struct {
 	w   rtp.WriteStream
 	typ string
 	mon *stats.CallMonitor
+	log *slog.Logger
 }
 
 func (w *rtpStatsWriter) String() string {
@@ -80,5 +99,20 @@ func (w *rtpStatsWriter) WriteRTP(h *prtp.Header, payload []byte) (int, error) {
 		}
 		w.mon.RTPPacketSend(typ)
 	}
+	
+	// Enhanced RTP packet sending logging (only if DEBUG_RTP is enabled)
+	if w.log != nil && os.Getenv("DEBUG_RTP") == "true" {
+		w.log.Info("📤 RTP packet sent by LiveKit worker",
+			"type", w.typ,
+			"payloadType", h.PayloadType,
+			"sequenceNumber", h.SequenceNumber,
+			"timestamp", h.Timestamp,
+			"payloadSize", len(payload),
+			"ssrc", h.SSRC,
+			"marker", h.Marker,
+			"direction", "outgoing",
+		)
+	}
+	
 	return w.w.WriteRTP(h, payload)
 }
