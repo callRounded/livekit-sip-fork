@@ -679,6 +679,9 @@ func (c *inboundCall) handleInvite(ctx context.Context, tid traceid.ID, req *sip
 
 	if roundedOpts == "" || !strings.Contains(roundedOpts, roundedOptionsNoRinging) {
 		c.cc.StartRinging()
+	} else {
+		c.log().Debugw("no-ringing rounded option found, not sending ringing but only attaching tag")
+		c.cc.attachTag()
 	}
 
 	// Send initial request. In the best case scenario, we will immediately get a room name to join.
